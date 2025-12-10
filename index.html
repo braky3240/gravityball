@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>重力弹球 - 音律解压</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none; /* 防止选中文本 */
+            touch-action: none; /* 防止移动端滚动 */
+        }
+
+        #game-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+
+        svg {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: crosshair;
+        }
+
+        /* UI 覆盖层 */
+        .ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none; /* 让点击穿透到 SVG */
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 300;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px rgba(255,255,255,0.3);
+        }
+
+        p {
+            margin: 5px 0 0 0;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            pointer-events: auto; /* 按钮需要点击 */
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 30px;
+            cursor: pointer;
+            backdrop-filter: blur(5px);
+            transition: all 0.3s ease;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.25);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        /* SVG 元素样式 */
+        .ball {
+            fill-opacity: 0.9;
+            stroke: rgba(255,255,255,0.4);
+            stroke-width: 1px;
+            transition: fill 0.2s;
+        }
+        
+        .wall {
+            stroke: #00d2ff;
+            stroke-width: 3px;
+            stroke-linecap: round;
+            fill: none;
+            filter: drop-shadow(0 0 5px #00d2ff);
+        }
+
+        .preview-line {
+            stroke: rgba(255, 255, 255, 0.3);
+            stroke-width: 2px;
+            stroke-dasharray: 5, 5;
+            pointer-events: none;
+        }
+
+        #hint {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: rgba(255,255,255,0.1);
+            font-size: 2rem;
+            pointer-events: none;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <svg id="game-svg" xmlns="http://www.w3.org/2000/svg">
+        <!-- 动态生成的元素将放在这里 -->
+        <line id="preview" class="preview-line" x1="0" y1="0" x2="0" y2="0" style="display:none" />
+    </svg>
+    
+    <div id="hint">点击并拖拽画线<br>以此作为弹球的墙壁</div>
+
+    <div class="ui-overlay">
+        <h1>重力弹球</h1>
+        <p>球体数量: <span id="ball-count">0</span></p>
+    </div>
+
+    <div class="controls">
+        <button id="btn-clear">清空画板</button>
+        <button id="btn-add-ball">手动加球</button>
+        <button id="btn-gravity">切换重力 (正常)</button>
+    </div>
+</div>
+
+<script>
+/**
+ * 向量数学辅助类
+ * 用于处理碰撞反弹计算
+ */
+class Vec2 {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    add(v) { return new Vec2(this.x + v.x, this.y + v.y); }
+    sub(v) { return new Vec2(this.x - v.x, this.y - v.y); }
+    mult(n) { return new Vec2(this.x * n, this.y * n); }
+    mag() { return Math.sqrt(this.x * this.x + this.y * this.y); }
+    
+    normalize() {
+        const m = this.mag();
+        if (m === 0) return new Vec2(0, 0);
+        return new Vec2(this.x / m, this.y / m);
+    }
+
+    dot(v) { return this.x * v.x + this.y * v.y; }
+    
+    // 计算点到线段最近的点
+    static closestPointOnSegment(p, a, b) {
+        const ab = b.sub(a);
+        const ap = p.sub(a);
+        let t = ap.dot(ab) / ab.dot(ab);
+        // 限制 t 在 0 到 1 之间 (线段范围内)
+        t = Math.max(0, Math.min(1, t));
+        return a.add(ab.mult(t));
+    }
+}
+
+/**
+ * 音频合成器
+ * 使用 Web Audio API 生成悦耳的撞击声
+ */
+const AudioEngine = {
+    ctx: null,
+    // 五声音阶频率 (Pentatonic Scale) 听起来比较和谐
+    frequencies: [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25], 
+    
+    init() {
+        if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (this.ctx.state === 'suspended') {
+            this.ctx.resume();
+        }
+    },
+
+    playTone(velocity) {
+        if (!this.ctx) return;
+
+        const osc = this.ctx.createOscillator();
+        const gainNode = this.ctx.createGain();
+
+        // 随机选一个音符
+        const freq = this.frequencies[Math.floor(Math.random() * this.frequencies.length)];
+        // 根据速度决定音高偏移，速度越快音调稍微越高一点
+        osc.frequency.value = freq; 
+        osc.type = 'sine';
+
+        // 音量基于撞击速度
+        const volume = Math.min(velocity / 15, 0.8);
+        gainNode.gain.setValueAtTime(volume, this.ctx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.5);
+
+        osc.connect(gainNode);
+        gainNode.connect(this.ctx.destination);
+
+        osc.start();
+        osc.stop(this.ctx.currentTime + 0.5);
+    }
+};
+
+/**
+ * 游戏主逻辑
+ */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById('game-svg');
+const previewLine = document.getElementById('preview');
+const ballCountDisplay = document.getElementById('ball-count');
+const hint = document.getElementById('hint');
+
+// 配置
+const CONFIG = {
+    gravity: 0.4,
+    friction: 0.99, // 空气阻力
+    wallBounciness: 0.8, // 墙壁弹性 (能量损耗)
+    maxBalls: 50,
+    spawnRate: 60, // 帧数间隔
+    colors: ['#ff5f5f', '#ffc04d', '#ffe869', '#85ff7a', '#60f3ff', '#cda1ff']
+};
+
+// 状态
+let balls = [];
+let walls = [];
+let isDrawing = false;
+let startPoint = null;
+let frameCount = 0;
+let animationId;
+
+// 类定义
+class Ball {
+    constructor(x, y) {
+        this.pos = new Vec2(x, y);
+        this.vel = new Vec2((Math.random() - 0.5) * 4, (Math.random() * 5)); // 初始随机速度
+        this.radius = 8 + Math.random() * 6; // 随机大小
+        this.color = CONFIG.colors[Math.floor(Math.random() * CONFIG.colors.length)];
+        
+        // SVG 元素
+        this.el = document.createElementNS(SVG_NS, 'circle');
+        this.el.setAttribute('r', this.radius);
+        this.el.setAttribute('fill', this.color);
+        this.el.classList.add('ball');
+        svg.appendChild(this.el);
+        
+        this.updateView();
+    }
+
+    update() {
+        // 应用重力
+        this.vel.y += CONFIG.gravity;
+        // 应用空气阻力
+        this.vel = this.vel.mult(CONFIG.friction);
+        // 更新位置
+        this.pos = this.pos.add(this.vel);
+
+        this.checkBoundary();
+        this.checkWalls();
+        this.updateView();
+    }
+
+    updateView() {
+        this.el.setAttribute('cx', this.pos.x);
+        this.el.setAttribute('cy', this.pos.y);
+    }
+
+    checkBoundary() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        // 左右墙壁反弹
+        if (this.pos.x < this.radius) {
+            this.pos.x = this.radius;
+            this.vel.x *= -0.7;
+        } else if (this.pos.x > width - this.radius) {
+            this.pos.x = width - this.radius;
+            this.vel.x *= -0.7;
+        }
+
+        // 掉出底部 -> 重置到顶部 (循环利用)
+        if (this.pos.y > height + 50) {
+            this.pos.y = -50;
+            this.pos.x = Math.random() * width;
+            this.vel = new Vec2(0, 0);
+        }
+    }
+
+    checkWalls() {
+        // 优化：只检查附近的墙壁 (简单的空间检查可以提升性能，这里为保持代码简洁，检查所有)
+        for (let wall of walls) {
+            const p1 = new Vec2(wall.x1, wall.y1);
+            const p2 = new Vec2(wall.x2, wall.y2);
+            
+            // 找到球心在墙壁线段上的最近点
+            const closest = Vec2.closestPointOnSegment(this.pos, p1, p2);
+            const distVec = this.pos.sub(closest);
+            const dist = distVec.mag();
+
+            // 发生碰撞
+            if (dist < this.radius) {
+                // 1. 修正位置 (防止穿模)：将球推离墙壁
+                // 只需要推出来 (Radius - Dist) 的距离
+                const normal = distVec.normalize();
+                const overlap = this.radius - dist;
+                
+                // 如果球正好在中心或计算异常，使用默认法线
+                const pushDir = (dist === 0) ? new Vec2(0, -1) : normal;
+                
+                this.pos = this.pos.add(pushDir.mult(overlap));
+
+                // 2. 速度反弹
+                // V_new = V_old - 2 * (V_old · N) * N
+                const dot = this.vel.dot(pushDir);
+                
+                // 只有当球朝向墙壁移动时才反弹 (防止球卡在墙里时被吸住)
+                if (dot < 0) {
+                    const reflection = pushDir.mult(2 * dot);
+                    this.vel = this.vel.sub(reflection).mult(CONFIG.wallBounciness);
+                    
+                    // 触发音效 (速度越大声音越响)
+                    const speed = this.vel.mag();
+                    if (speed > 1) {
+                        AudioEngine.playTone(speed);
+                        
+                        // 简单的视觉反馈：碰撞时球变亮
+                        this.el.setAttribute('fill', '#ffffff');
+                        setTimeout(() => this.el.setAttribute('fill', this.color), 100);
+                    }
+                }
+            }
+        }
+    }
+
+    remove() {
+        svg.removeChild(this.el);
+    }
+}
+
+// 交互逻辑
+function setupInteraction() {
+    svg.addEventListener('mousedown', startDrawing);
+    svg.addEventListener('touchstart', (e) => startDrawing(e.touches[0]));
+    
+    window.addEventListener('mousemove', draw);
+    window.addEventListener('touchmove', (e) => draw(e.touches[0]));
+    
+    window.addEventListener('mouseup', endDrawing);
+    window.addEventListener('touchend', endDrawing);
+}
+
+function startDrawing(e) {
+    // 首次交互初始化音频上下文
+    AudioEngine.init();
+    if(hint) hint.style.display = 'none';
+
+    isDrawing = true;
+    const rect = svg.getBoundingClientRect();
+    startPoint = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    
+    // 显示预览线
+    previewLine.setAttribute('x1', startPoint.x);
+    previewLine.setAttribute('y1', startPoint.y);
+    previewLine.setAttribute('x2', startPoint.x);
+    previewLine.setAttribute('y2', startPoint.y);
+    previewLine.style.display = 'block';
+}
+
+function draw(e) {
+    if (!isDrawing) return;
+    const rect = svg.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    
+    previewLine.setAttribute('x2', x);
+    previewLine.setAttribute('y2', y);
+}
+
+function endDrawing(e) {
+    if (!isDrawing) return;
+    isDrawing = false;
+    previewLine.style.display = 'none';
+
+    // 获取结束点
+    let clientX, clientY;
+    if (e.type === 'touchend') {
+        // 移动端取最后一次触摸位置略复杂，这里简化使用 preview 的坐标
+        clientX = parseFloat(previewLine.getAttribute('x2')) + svg.getBoundingClientRect().left;
+        clientY = parseFloat(previewLine.getAttribute('y2')) + svg.getBoundingClientRect().top;
+    } else {
+        clientX = e.clientX;
+        clientY = e.clientY;
+    }
+
+    const rect = svg.getBoundingClientRect();
+    const endX = clientX - rect.left;
+    const endY = clientY - rect.top;
+
+    // 防止点击产生长度为0的线
+    const dist = Math.hypot(endX - startPoint.x, endY - startPoint.y);
+    if (dist < 10) return;
+
+    createWall(startPoint.x, startPoint.y, endX, endY);
+}
+
+function createWall(x1, y1, x2, y2) {
+    const wall = { x1, y1, x2, y2 };
+    walls.push(wall);
+
+    const lineEl = document.createElementNS(SVG_NS, 'line');
+    lineEl.setAttribute('x1', x1);
+    lineEl.setAttribute('y1', y1);
+    lineEl.setAttribute('x2', x2);
+    lineEl.setAttribute('y2', y2);
+    lineEl.classList.add('wall');
+    
+    // 插入到球体之前，保证球体在上方
+    if (balls.length > 0) {
+        svg.insertBefore(lineEl, balls[0].el);
+    } else {
+        svg.appendChild(lineEl);
+    }
+    
+    // 绑定DOM元素以便后续删除
+    wall.el = lineEl;
+}
+
+function createBall() {
+    if (balls.length >= CONFIG.maxBalls) return;
+    // 在顶部随机宽度生成
+    const x = Math.random() * window.innerWidth;
+    balls.push(new Ball(x, -20));
+    ballCountDisplay.textContent = balls.length;
+}
+
+// 游戏循环
+function loop() {
+    // 自动生成球
+    frameCount++;
+    if (frameCount % CONFIG.spawnRate === 0) {
+        createBall();
+    }
+
+    balls.forEach(ball => ball.update());
+
+    animationId = requestAnimationFrame(loop);
+}
+
+// UI 按钮控制
+document.getElementById('btn-clear').addEventListener('click', () => {
+    walls.forEach(w => svg.removeChild(w.el));
+    walls = [];
+    balls.forEach(b => b.remove());
+    balls = [];
+    ballCountDisplay.textContent = 0;
+});
+
+document.getElementById('btn-add-ball').addEventListener('click', () => {
+    AudioEngine.init();
+    createBall();
+});
+
+const btnGravity = document.getElementById('btn-gravity');
+btnGravity.addEventListener('click', () => {
+    if (CONFIG.gravity > 0) {
+        CONFIG.gravity = 0;
+        btnGravity.textContent = "切换重力 (失重)";
+        // 失重时给所有球一点随机冲量，防止静止
+        balls.forEach(b => {
+            b.vel.x += (Math.random()-0.5) * 2;
+            b.vel.y += (Math.random()-0.5) * 2;
+        });
+    } else {
+        CONFIG.gravity = 0.4;
+        btnGravity.textContent = "切换重力 (正常)";
+    }
+});
+
+// 初始化
+setupInteraction();
+loop();
+createBall(); // 先来一个
+
+</script>
+</body>
+</html>
